@@ -26,7 +26,7 @@ The keep-set only grows, so running `generate` again (by hand, from a timer or f
 ## Install
 
 ```sh
-git clone https://github.com/<owner>/kmod-guard.git
+git clone https://github.com/webo3/kmod-guard.git
 cd kmod-guard
 sudo make install
 ```
