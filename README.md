@@ -16,12 +16,13 @@ keep  = modules loaded now                      (/proc/modules)
       + every module ever seen loaded on this host (/var/lib/kmod-guard/learned)
       + allow entries                          (/etc/kmod-guard/allow.d/*.conf)
       + their dependencies                     (modules.dep, softdep, aliases) in every installed kernel
+      - deny entries, unless loaded now         (/etc/kmod-guard/deny.d/*.conf)
 block = modules of the running kernel - keep
 ```
 
 Each blocked module gets `install <module> /usr/local/sbin/kmod-guard blocked <module>`. When something tries to load it, modprobe runs that command instead. It logs the attempt to syslog and the module stays unloaded.
 
-The keep-set only grows, so running `generate` again (by hand, from a timer or from configuration management) can only block modules that are new to the running kernel.
+The keep-set only grows, so running `generate` again (by hand, from a timer or from configuration management) can only block modules that are new to the running kernel, or modules you deny.
 
 ## Install
 
@@ -74,19 +75,31 @@ These stay blocked unless the host already uses them: uncommon socket families, 
 
 More examples: [Proxmox VE](examples/allow.d/proxmox-ve.conf), [Docker Swarm](examples/allow.d/docker-swarm.conf), [WireGuard](examples/allow.d/wireguard.conf).
 
+## Deny lists
+
+`/etc/kmod-guard/deny.d/*.conf` takes the same entries and the same ownership rules as `allow.d`. A denied module is blocked even when an allow entry, the learned set or a dependency would keep it. Use it to close a module a broad allow entry covers (`kvm_amd` under `path:kernel/arch/x86/`) or one that stays kept as a dependency (`bridge`, needed by `nft_meta_bridge` and `nf_conntrack_bridge`).
+
+- A denied module's own dependencies are not kept because of it.
+- Modules that depend on a denied module stay loadable, but they fail to load without it.
+- A loaded module is never blocked. A deny entry for a loaded module is skipped (`deny_loaded_list=` in the summary) and takes effect at the first `generate` after it's unloaded.
+- `kmod-guard deny <module>` refuses a loaded module (exit 75) and tells you to `rmmod` it first. It also refuses names that aren't modules of the running kernel, or that are built into it.
+- `00-managed.conf` is meant for configuration management; `local.conf` receives `kmod-guard deny` additions.
+
 ## Usage
 
 ```
-kmod-guard generate [--dry-run] [--force] [--quiet] [--managed "<entries>"] [--probe "<modules>"]
+kmod-guard generate [--dry-run] [--force] [--quiet] [--managed "<entries>"]
+                    [--managed-deny "<entries>"] [--probe "<modules>"]
 kmod-guard allow <module>...    allow on this host now (written to allow.d/local.conf)
+kmod-guard deny <module>...     block on this host now, even if allowed (deny.d/local.conf)
 kmod-guard disable              remove the blocklist; stays off until `kmod-guard enable`
 kmod-guard enable
-kmod-guard status               state, local allows, recent blocks
+kmod-guard status               state, local allows and denies, recent blocks
 kmod-guard version
 ```
 
 `generate` prints a `key=value` summary (counts, newly blocked and newly allowed modules), ending with `result=changed|unchanged|skipped|disabled`. With `--dry-run` it ends with `result=dry-run` and `would_change=yes|no` instead. Two options serve configuration management:
-- `--managed` previews a new managed list without writing it.
+- `--managed` and `--managed-deny` preview new managed lists without writing them.
 - `--probe` answers "which of these modules would be blocked here?".
 
 To load a blocked module once, as root: `modprobe --ignore-install <module>`.
@@ -116,7 +129,7 @@ kmod-guard: blocked module=tipc trigger=autoload parent=kthreadd[2] uid=0 loginu
 - The initramfs hooks strip the blocklist from boot images, so a new kernel can always load its root-disk drivers.
 - Writes are atomic, and an unchanged file isn't rewritten.
 
-Exit codes: 64 usage, 65 invalid allow entry, 66 missing `modules.dep` or `/proc/modules`, 70 refused blocklist, 77 allow file with unsafe ownership or permissions.
+Exit codes: 64 usage, 65 invalid allow or deny entry, 66 missing `modules.dep` or `/proc/modules`, 70 refused blocklist, 75 `deny` of a loaded module, 77 allow or deny file with unsafe ownership or permissions.
 
 ## Limits
 

@@ -12,7 +12,7 @@ DRACUT   = $(DESTDIR)/usr/lib/dracut/modules.d
 
 install:
 	install -D -m 0755 kmod-guard $(SBIN)/kmod-guard
-	install -d -m 0755 $(CONF)/allow.d $(STATE)
+	install -d -m 0755 $(CONF)/allow.d $(CONF)/deny.d $(STATE)
 	test -e $(CONF)/allow.d/00-managed.conf || \
 		install -m 0644 examples/allow.d/00-managed.conf $(CONF)/allow.d/00-managed.conf
 	if [ -d $(ITOOLS) ]; then install -m 0755 hooks/initramfs-tools-hook $(ITOOLS)/zz-kmod-guard; fi

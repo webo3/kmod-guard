@@ -8,8 +8,13 @@
 #        + every module ever seen loaded here (/var/lib/kmod-guard/learned)
 #        + allow entries from /etc/kmod-guard/allow.d/*.conf
 #        + their dependencies (modules.dep, softdep) in every installed kernel
+#        - deny entries from /etc/kmod-guard/deny.d/*.conf, unless loaded now
 #
-# Allow entries, whitespace-separated, `#` starts a comment:
+# A denied module is blocked even when it is allowed, learned or a dependency
+# of a kept module, and its own dependencies are not kept on its behalf.
+# Modules that depend on it stay loadable but fail to load without it.
+#
+# Allow and deny entries, whitespace-separated, `#` starts a comment:
 #   xfs                         module name (- and _ are equivalent)
 #   nft_*  ip_set*              glob on the module name (* and ?)
 #   path:kernel/drivers/edac/   prefix of the module path under /lib/modules/<kver>/
@@ -18,8 +23,9 @@
 # syslog (tag kmod-guard) and the module is not loaded. Root can still load
 # anything with insmod or `modprobe --ignore-install`.
 #
-# allow.d/00-managed.conf is for configuration management (Ansible, ...);
-# local.conf collects `kmod-guard allow` additions made on the host.
+# {allow,deny}.d/00-managed.conf are for configuration management (Ansible,
+# ...); local.conf collects `kmod-guard allow` / `kmod-guard deny` additions
+# made on the host.
 #
 # Same idea as modulejail (https://github.com/jnuyens/modulejail).
 
@@ -37,7 +43,7 @@ OUTPUT=${KMOD_GUARD_OUTPUT:-/etc/modprobe.d/kmod-guard.conf}
 MODULES_ROOT=${KMOD_GUARD_MODULES_ROOT:-/lib/modules}
 PROC_MODULES=${KMOD_GUARD_PROC_MODULES:-/proc/modules}
 KVER=${KMOD_GUARD_KVER:-$(uname -r)}
-MANAGED_ALLOW=00-managed.conf
+MANAGED_CONF=00-managed.conf
 
 usage() {
     cat <<'EOF'
@@ -47,8 +53,11 @@ Usage:
       --force                    skip the first-run uptime guard
       --quiet                    print only the result line
       --managed "<entries>"      use these entries instead of allow.d/00-managed.conf
+      --managed-deny "<entries>" use these entries instead of deny.d/00-managed.conf
       --probe "<modules>"        report which of these modules would be blocked
   kmod-guard allow <module>...   allow on this host now (allow.d/local.conf)
+  kmod-guard deny <module>...    block on this host now, even if allowed
+                                 (deny.d/local.conf); unload it first
   kmod-guard disable             remove the blocklist until `kmod-guard enable`
   kmod-guard enable
   kmod-guard status
@@ -72,8 +81,8 @@ conf_get() {
     esac
 }
 
-# check_owner FILE: allow files are trusted by whoever runs this (root), so
-# only root or that user may own or write them
+# check_owner FILE: allow and deny files are trusted by whoever runs this
+# (root), so only root or that user may own or write them
 check_owner() {
     [ -n "$(find "$1" \( -user 0 -o -user "$(id -u)" \) ! -perm -020 ! -perm -002)" ] ||
         die 77 "$1 must be owned by root and not group/world-writable"
@@ -92,8 +101,56 @@ list() {
     fi
 }
 
+# read_entries KIND OUT SET VALUE: validated entries of $CONF_DIR/KIND.d/*.conf,
+# one per line, into OUT. With SET=1, VALUE replaces KIND.d/00-managed.conf.
+read_entries() {
+    {
+        if [ "$3" -eq 1 ]; then
+            printf '%s\n' "$4"
+        elif [ -f "$CONF_DIR/$1.d/$MANAGED_CONF" ]; then
+            check_owner "$CONF_DIR/$1.d/$MANAGED_CONF"
+            cat "$CONF_DIR/$1.d/$MANAGED_CONF"
+        fi
+        for f in "$CONF_DIR/$1.d"/*.conf; do
+            [ -f "$f" ] || continue
+            [ "${f##*/}" = "$MANAGED_CONF" ] && continue
+            check_owner "$f"
+            cat "$f"
+        done
+    } >"$2.raw"
+    awk -v kind="$1" '
+        { sub(/#.*/, "") }
+        {
+            for (i = 1; i <= NF; i++) {
+                e = $i
+                if (e ~ /^path:[A-Za-z0-9_.\/-]+$/) { print e; continue }
+                if (e ~ /^[A-Za-z0-9_*?-]+$/) { gsub(/-/, "_", e); print e; continue }
+                printf "kmod-guard: invalid %s entry: %s\n", kind, e > "/dev/stderr"
+                bad = 1
+            }
+        }
+        END { exit bad ? 65 : 0 }
+    ' "$2.raw" >"$2.unsorted" || exit 65
+    sort -u "$2.unsorted" >"$2"
+}
+
+# is_loaded MODULE
+is_loaded() {
+    awk -v m="$1" '$1 == m { f = 1 } END { exit !f }' "$PROC_MODULES"
+}
+
+# lists_module FILE MODULE: FILE (modules.dep, modules.builtin) has MODULE
+lists_module() {
+    [ -r "$1" ] || return 1
+    awk -v m="$2" '
+        { n = $1; sub(/:$/, "", n); sub(/.*\//, "", n); gsub(/-/, "_", n) }
+        sub(/\.ko(\.xz|\.gz|\.zst)?$/, "", n) && n == m { f = 1; exit }
+        END { exit !f }
+    ' "$1"
+}
+
 cmd_generate() {
-    dry_run=0 force=0 quiet=0 managed='' managed_set=0 probe='' probe_set=0
+    dry_run=0 force=0 quiet=0 managed='' managed_set=0 managed_deny='' managed_deny_set=0 probe='' probe_set=0
     while [ $# -gt 0 ]; do
         case $1 in
             --dry-run) dry_run=1 ;;
@@ -102,6 +159,11 @@ cmd_generate() {
             --managed)
                 [ $# -ge 2 ] || die 64 "--managed needs a value"
                 managed=$2 managed_set=1
+                shift
+                ;;
+            --managed-deny)
+                [ $# -ge 2 ] || die 64 "--managed-deny needs a value"
+                managed_deny=$2 managed_deny_set=1
                 shift
                 ;;
             --probe)
@@ -150,34 +212,9 @@ cmd_generate() {
         fi
     fi
 
-    # Allow entries: managed list (file or --managed), then every other allow file
-    : >"$work/allow.raw"
-    if [ "$managed_set" -eq 1 ]; then
-        printf '%s\n' "$managed" >>"$work/allow.raw"
-    elif [ -f "$CONF_DIR/allow.d/$MANAGED_ALLOW" ]; then
-        check_owner "$CONF_DIR/allow.d/$MANAGED_ALLOW"
-        cat "$CONF_DIR/allow.d/$MANAGED_ALLOW" >>"$work/allow.raw"
-    fi
-    for f in "$CONF_DIR"/allow.d/*.conf; do
-        [ -f "$f" ] || continue
-        [ "${f##*/}" = "$MANAGED_ALLOW" ] && continue
-        check_owner "$f"
-        cat "$f" >>"$work/allow.raw"
-    done
-    awk '
-        { sub(/#.*/, "") }
-        {
-            for (i = 1; i <= NF; i++) {
-                e = $i
-                if (e ~ /^path:[A-Za-z0-9_.\/-]+$/) { print e; continue }
-                if (e ~ /^[A-Za-z0-9_*?-]+$/) { gsub(/-/, "_", e); print e; continue }
-                printf "kmod-guard: invalid allow entry: %s\n", e > "/dev/stderr"
-                bad = 1
-            }
-        }
-        END { exit bad ? 65 : 0 }
-    ' "$work/allow.raw" >"$work/allow.unsorted" || exit 65
-    sort -u "$work/allow.unsorted" >"$work/allow"
+    # Managed list (file or --managed*), then every other file of the directory
+    read_entries allow "$work/allow" "$managed_set" "$managed"
+    read_entries deny "$work/deny" "$managed_deny_set" "$managed_deny"
 
     # softdep lines from depmod output and modprobe config
     cat "$MODULES_ROOT"/*/modules.softdep /etc/modprobe.d/*.conf /run/modprobe.d/*.conf \
@@ -196,13 +233,18 @@ cmd_generate() {
     # Every installed kernel's modules.dep feeds the allow matching and the
     # dependency graph; only the running kernel's modules can be blocked.
     # softdep targets are often aliases (libcrc32c -> crc32c), resolved
-    # through modules.alias.
+    # through modules.alias. A deny entry wins over everything but a loaded
+    # module, and a denied module doesn't pull its dependencies into keep.
     : >"$work/keep.raw"
     : >"$work/block.raw"
+    : >"$work/denied.raw"
+    : >"$work/deny_loaded.raw"
     # shellcheck disable=SC2086 # kernel versions contain no whitespace
-    awk -v allowf="$work/allow" -v seedf="$work/seed" -v softf="$work/softdep" \
+    awk -v allowf="$work/allow" -v denyf="$work/deny" -v seedf="$work/seed" \
+        -v loadedf="$work/loaded" -v softf="$work/softdep" \
         -v aliasfiles="$aliases" -v curdep="$dep" \
-        -v keepout="$work/keep.raw" -v blockout="$work/block.raw" '
+        -v keepout="$work/keep.raw" -v blockout="$work/block.raw" \
+        -v deniedout="$work/denied.raw" -v denyloadedout="$work/deny_loaded.raw" '
         function modname(p,   n) {
             n = p
             sub(/.*\//, "", n)
@@ -210,17 +252,23 @@ cmd_generate() {
             gsub(/-/, "_", n)
             return n
         }
+        function globre(e) {
+            gsub(/\*/, ".*", e)
+            gsub(/\?/, ".", e)
+            return "^" e "$"
+        }
         BEGIN {
             while ((getline e < allowf) > 0) {
                 if (e ~ /^path:/) prefix[++np] = substr(e, 6)
-                else if (e ~ /[*?]/) {
-                    g = e
-                    gsub(/\*/, ".*", g)
-                    gsub(/\?/, ".", g)
-                    glob[++ng] = "^" g "$"
-                }
+                else if (e ~ /[*?]/) glob[++ng] = globre(e)
                 else keep[e] = 1
             }
+            while ((getline e < denyf) > 0) {
+                if (e ~ /^path:/) dprefix[++ndp] = substr(e, 6)
+                else if (e ~ /[*?]/) dglob[++ndg] = globre(e)
+                else dname[e] = 1
+            }
+            while ((getline e < loadedf) > 0) loaded[e] = 1
             while ((getline e < seedf) > 0) keep[e] = 1
             while ((getline e < softf) > 0) {
                 # softdep <module> pre: <a> <b> post: <c>
@@ -269,26 +317,45 @@ cmd_generate() {
                 d = modname($i)
                 if (d != "") deps[m] = deps[m] " " d
             }
+            if (!(m in denied)) {
+                if (m in dname) denied[m] = 1
+                for (i = 1; i <= ndp; i++) if (index(p, dprefix[i]) == 1) denied[m] = 1
+                for (i = 1; i <= ndg; i++) if (m ~ dglob[i]) denied[m] = 1
+            }
             if (m in keep) next
             for (i = 1; i <= np; i++) if (index(p, prefix[i]) == 1) { keep[m] = 1; next }
             for (i = 1; i <= ng; i++) if (m ~ glob[i]) { keep[m] = 1; next }
         }
         END {
-            for (m in keep) queue[++qn] = m
+            # Never block a loaded module; the deny applies once it is unloaded
+            for (m in denied) {
+                if (m in loaded) {
+                    print m > denyloadedout
+                    delete denied[m]
+                }
+            }
+            for (m in keep) if (!(m in denied)) queue[++qn] = m
             for (qi = 1; qi <= qn; qi++) {
                 n = split(deps[queue[qi]], dl, " ")
                 for (i = 1; i <= n; i++) {
-                    if (!(dl[i] in keep)) {
+                    if (!(dl[i] in keep) && !(dl[i] in denied)) {
                         keep[dl[i]] = 1
                         queue[++qn] = dl[i]
                     }
                 }
             }
-            for (m in universe) print m > ((m in keep) ? keepout : blockout)
+            for (m in universe) {
+                if (m in denied) {
+                    print m > deniedout
+                    print m > blockout
+                } else print m > ((m in keep) ? keepout : blockout)
+            }
         }
     ' $deps
     sort -u "$work/keep.raw" >"$work/keep"
     sort -u "$work/block.raw" >"$work/block"
+    sort -u "$work/denied.raw" >"$work/denied"
+    sort -u "$work/deny_loaded.raw" >"$work/deny_loaded"
 
     [ -s "$work/block" ] || die 70 "refusing to write an empty blocklist"
     bad=$(comm -12 "$work/loaded" "$work/block" | tr '\n' ' ')
@@ -307,8 +374,9 @@ cmd_generate() {
     {
         echo "# Generated by kmod-guard. Do not edit."
         echo "# Allow a module on this host: kmod-guard allow <module>"
+        echo "# Deny a module on this host:  kmod-guard deny <module>"
         echo "# Emergency off switch:        kmod-guard disable"
-        echo "# kernel=$KVER kept=$(count "$work/keep") blocked=$(count "$work/block")"
+        echo "# kernel=$KVER kept=$(count "$work/keep") blocked=$(count "$work/block") denied=$(count "$work/denied")"
         awk -v h="$SELF" '{ printf "install %s %s blocked %s\n", $1, h, $1 }' "$work/block"
     } >"$work/out"
 
@@ -320,6 +388,9 @@ cmd_generate() {
         echo "universe=$(($(count "$work/keep") + $(count "$work/block")))"
         echo "kept=$(count "$work/keep")"
         echo "blocked=$(count "$work/block")"
+        echo "denied=$(count "$work/denied")"
+        echo "denied_list=$(list "$work/denied")"
+        echo "deny_loaded_list=$(list "$work/deny_loaded")"
         echo "loaded=$(count "$work/loaded")"
         echo "learned=$(count "$work/learned")"
         echo "current_blocked=$current"
@@ -398,20 +469,69 @@ cmd_blocked() {
     exit "$(conf_get BLOCK_EXIT 0)"
 }
 
-cmd_allow() {
-    [ $# -gt 0 ] || die 64 "usage: kmod-guard allow <module>..."
+# check_names KIND MODULE...: module names only, no globs or paths
+check_names() {
+    kind=$1
+    shift
+    [ $# -gt 0 ] || die 64 "usage: kmod-guard $kind <module>..."
     for m in "$@"; do
         case $m in
             '' | *[!A-Za-z0-9_-]*) die 65 "invalid module name: $m" ;;
         esac
     done
-    mkdir -p "$CONF_DIR/allow.d"
-    f=$CONF_DIR/allow.d/local.conf
+}
+
+# add_local KIND MODULE...: append to KIND.d/local.conf
+add_local() {
+    kind=$1
+    shift
+    mkdir -p "$CONF_DIR/$kind.d"
+    f=$CONF_DIR/$kind.d/local.conf
     if [ ! -f "$f" ]; then
-        echo "# Added on this host with 'kmod-guard allow'." >"$f"
+        echo "# Added on this host with 'kmod-guard $kind'." >"$f"
     fi
     printf '%s  # %s %s\n' "$*" "$(date +%F)" "${SUDO_USER:-$(id -un)}" >>"$f"
     chmod 0644 "$f"
+}
+
+cmd_allow() {
+    check_names allow "$@"
+    add_local allow "$@"
+    cmd_generate --force
+    [ -f "$OUTPUT" ] || return 0
+    for m in "$@"; do
+        m=$(printf '%s' "$m" | tr - _)
+        if grep -q "^install $m " "$OUTPUT"; then
+            printf 'kmod-guard: %s is still blocked by a deny entry (%s/deny.d/)\n' "$m" "$CONF_DIR" >&2
+        fi
+    done
+}
+
+# cmd_deny: a loaded module can't be blocked (generate would leave it out), so
+# refuse up front rather than record a deny that silently waits for an unload.
+cmd_deny() {
+    check_names deny "$@"
+    dep=$MODULES_ROOT/$KVER/modules.dep
+    [ -r "$dep" ] || die 66 "$dep not found (run depmod)"
+    [ -r "$PROC_MODULES" ] || die 66 "$PROC_MODULES not readable"
+    loaded=''
+    for m in "$@"; do
+        m=$(printf '%s' "$m" | tr - _)
+        if lists_module "$MODULES_ROOT/$KVER/modules.builtin" "$m"; then
+            die 65 "$m is built into kernel $KVER, it can't be blocked"
+        fi
+        lists_module "$dep" "$m" || die 65 "$m is not a module of kernel $KVER"
+        if is_loaded "$m"; then
+            loaded="$loaded $m"
+        fi
+    done
+    if [ -n "$loaded" ]; then
+        printf 'kmod-guard: currently loaded:%s\n' "$loaded" >&2
+        printf 'kmod-guard: a loaded module is never blocked. Unload it first, then deny it again:\n' >&2
+        printf '  rmmod%s\n' "$loaded" >&2
+        exit 75
+    fi
+    add_local deny "$@"
     cmd_generate --force
 }
 
@@ -441,6 +561,10 @@ cmd_status() {
         echo "local allows:"
         grep -v '^#' "$CONF_DIR/allow.d/local.conf" | sed 's/^/  /'
     fi
+    if [ -f "$CONF_DIR/deny.d/local.conf" ]; then
+        echo "local denies:"
+        grep -v '^#' "$CONF_DIR/deny.d/local.conf" | sed 's/^/  /'
+    fi
     if command -v journalctl >/dev/null 2>&1; then
         echo "recent blocks:"
         journalctl -t kmod-guard -n 20 --no-pager -o short-iso 2>/dev/null | sed 's/^/  /'
@@ -453,6 +577,7 @@ case $cmd in
     generate) cmd_generate "$@" ;;
     blocked) cmd_blocked "$@" ;;
     allow) cmd_allow "$@" ;;
+    deny) cmd_deny "$@" ;;
     disable) cmd_disable ;;
     enable) cmd_enable ;;
     status) cmd_status ;;

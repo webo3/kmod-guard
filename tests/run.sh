@@ -169,6 +169,46 @@ check "allow tipc unblocks it" "! blocked tipc"
 check "allow rejects globs" "! KMOD_GUARD_KVER=6.1.0-new $KG allow 'x*' >/dev/null 2>&1"
 check "version" "$KG version | grep -q '^kmod-guard [0-9]'"
 
+echo "--- deny"
+mkdir -p "$R/etc/deny.d"
+echo 'nfs sctp path:kernel/drivers/edac/ xfs udp-tunnel' >"$R/etc/deny.d/10-test.conf"
+chmod 644 "$R/etc/deny.d/10-test.conf"
+out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate 2>&1)
+check "deny wins over an allow entry" "blocked nfs"
+check "denied module doesn't keep its dependencies" "blocked sunrpc && blocked lockd"
+check "deny wins over the learned set" "blocked sctp"
+check "deny path wins over allow path" "blocked amd64_edac && blocked edac_mce_amd"
+check "loaded module in deny.d is left alone" "! blocked xfs && printed result=changed"
+check "summary lists denied and loaded denies" "printed 'deny_loaded_list=xfs' && printed 'denied=5'"
+check "deny wins over a dependency of a kept module" "! blocked wireguard && blocked udp_tunnel"
+out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate --dry-run --managed-deny 'wireguard' --probe wireguard 2>&1)
+check "--managed-deny adds to deny.d" "printed 'probe_blocked=wireguard' && printed 'denied=6'"
+echo 'bad;name' >"$R/etc/deny.d/10-test.conf"
+KMOD_GUARD_KVER=6.1.0-new $KG generate >/dev/null 2>&1
+check "invalid deny entry refused (65)" "[ $? -eq 65 ]"
+rm -f "$R/etc/deny.d/10-test.conf"
+
+out=$(KMOD_GUARD_KVER=6.1.0-new $KG deny xfs 2>&1)
+check "deny of a loaded module refused (75)" "[ $? -eq 75 ]"
+check "deny of a loaded module says to rmmod" "printed '  rmmod xfs'"
+check "refused deny writes nothing" "[ ! -e '$R/etc/deny.d/local.conf' ]"
+KMOD_GUARD_KVER=6.1.0-new $KG deny no_such_mod >/dev/null 2>&1
+check "deny of an unknown module refused (65)" "[ $? -eq 65 ]"
+echo 'kernel/net/bridge/bridge.ko' >"$R/lib/6.1.0-new/modules.builtin"
+KMOD_GUARD_KVER=6.1.0-new $KG deny bridge >/dev/null 2>&1
+check "deny of a built-in module refused (65)" "[ $? -eq 65 ]"
+check "deny rejects globs" "! KMOD_GUARD_KVER=6.1.0-new $KG deny 'x*' >/dev/null 2>&1"
+KMOD_GUARD_KVER=6.1.0-new $KG deny tipc >/dev/null 2>&1
+check "deny tipc blocks it though allowed" "blocked tipc && grep -q '^tipc ' '$R/etc/deny.d/local.conf'"
+out=$(KMOD_GUARD_KVER=6.1.0-new $KG allow tipc 2>&1)
+check "allow warns about a deny entry" "printf '%s\n' \"\$out\" | grep -q 'tipc is still blocked by a deny entry'"
+loaded xfs tipc
+out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate 2>&1)
+check "denied module loaded anyway is not blocked" "! blocked tipc && printed 'deny_loaded_list=tipc'"
+loaded xfs
+KMOD_GUARD_KVER=6.1.0-new $KG generate >/dev/null 2>&1
+check "deny applies again once unloaded" "blocked tipc"
+
 if [ -r /proc/self/status ]; then
     echo "--- blocked handler (Linux)"
     $KG blocked testmod >/dev/null 2>&1
