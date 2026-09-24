@@ -146,3 +146,7 @@ The idea comes from [modulejail](https://github.com/jnuyens/modulejail) by Jaspe
 - dependency resolution;
 - the sticky learned set;
 - allow entries by glob and path.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
