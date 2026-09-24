@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make lint
+
+  # Each image brings a different sh / awk: dash + mawk (Debian, Ubuntu),
+  # bash + gawk (EL8, EL9), busybox (Alpine).
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:12, ubuntu:24.04, almalinux:8, rockylinux:9, alpine:3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests in ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src ${{ matrix.image }} sh -c '
+            command -v cmp >/dev/null || { dnf -y -q install diffutils || yum -y -q install diffutils; }
+            sh tests/run.sh'

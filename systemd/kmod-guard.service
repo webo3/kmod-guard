@@ -1,0 +1,7 @@
+[Unit]
+Description=Regenerate the kernel module blocklist (kmod-guard)
+ConditionPathExists=!/etc/kmod-guard/disabled
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kmod-guard generate --quiet

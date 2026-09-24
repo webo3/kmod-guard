@@ -1,0 +1,13 @@
+#!/bin/sh
+# kmod-guard: keep the module blocklist out of the initramfs. It is a
+# policy for the running system and must not stop a new kernel from loading
+# its root-disk drivers at boot.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+rm -f "${DESTDIR}/etc/modprobe.d/kmod-guard.conf"

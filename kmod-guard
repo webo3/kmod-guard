@@ -1,0 +1,465 @@
+#!/bin/sh
+# kmod-guard: block on-demand loading of kernel modules this host does not use.
+#
+# Writes /etc/modprobe.d/kmod-guard.conf with an `install <module> ...` line for
+# every module of the running kernel that is not in the keep-set:
+#
+#   keep = modules loaded now (/proc/modules)
+#        + every module ever seen loaded here (/var/lib/kmod-guard/learned)
+#        + allow entries from /etc/kmod-guard/allow.d/*.conf
+#        + their dependencies (modules.dep, softdep) in every installed kernel
+#
+# Allow entries, whitespace-separated, `#` starts a comment:
+#   xfs                         module name (- and _ are equivalent)
+#   nft_*  ip_set*              glob on the module name (* and ?)
+#   path:kernel/drivers/edac/   prefix of the module path under /lib/modules/<kver>/
+#
+# A blocked load runs `kmod-guard blocked <module>`: it logs the caller to
+# syslog (tag kmod-guard) and the module is not loaded. Root can still load
+# anything with insmod or `modprobe --ignore-install`.
+#
+# allow.d/00-managed.conf is for configuration management (Ansible, ...);
+# local.conf collects `kmod-guard allow` additions made on the host.
+#
+# Same idea as modulejail (https://github.com/jnuyens/modulejail).
+
+set -eu
+LC_ALL=C
+export LC_ALL
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+VERSION=0.1.0
+SELF=/usr/local/sbin/kmod-guard
+CONF_DIR=${KMOD_GUARD_CONF_DIR:-/etc/kmod-guard}
+STATE_DIR=${KMOD_GUARD_STATE_DIR:-/var/lib/kmod-guard}
+OUTPUT=${KMOD_GUARD_OUTPUT:-/etc/modprobe.d/kmod-guard.conf}
+MODULES_ROOT=${KMOD_GUARD_MODULES_ROOT:-/lib/modules}
+PROC_MODULES=${KMOD_GUARD_PROC_MODULES:-/proc/modules}
+KVER=${KMOD_GUARD_KVER:-$(uname -r)}
+MANAGED_ALLOW=00-managed.conf
+
+usage() {
+    cat <<'EOF'
+Usage:
+  kmod-guard generate [options]  rebuild /etc/modprobe.d/kmod-guard.conf
+      --dry-run                  print the summary, write nothing
+      --force                    skip the first-run uptime guard
+      --quiet                    print only the result line
+      --managed "<entries>"      use these entries instead of allow.d/00-managed.conf
+      --probe "<modules>"        report which of these modules would be blocked
+  kmod-guard allow <module>...   allow on this host now (allow.d/local.conf)
+  kmod-guard disable             remove the blocklist until `kmod-guard enable`
+  kmod-guard enable
+  kmod-guard status
+  kmod-guard version
+EOF
+}
+
+die() {
+    code=$1
+    shift
+    printf 'kmod-guard: %s\n' "$*" >&2
+    exit "$code"
+}
+
+# conf_get KEY DEFAULT: numeric KEY=value from kmod-guard.conf
+conf_get() {
+    v=$(awk -F= -v k="$1" '$1 == k { v = $2 } END { print v }' "$CONF_DIR/kmod-guard.conf" 2>/dev/null || true)
+    case $v in
+        '' | *[!0-9]*) printf '%s\n' "$2" ;;
+        *) printf '%s\n' "$v" ;;
+    esac
+}
+
+# check_owner FILE: allow files are trusted by whoever runs this (root), so
+# only root or that user may own or write them
+check_owner() {
+    ls -ln "$1" | awk -v me="$(id -u)" '{ exit (($3 != 0 && $3 != me) || substr($1, 6, 1) == "w" || substr($1, 9, 1) == "w") }' ||
+        die 77 "$1 must be owned by root and not group/world-writable"
+}
+
+count() {
+    wc -l <"$1" | tr -d ' '
+}
+
+# list FILE: space-separated contents, or a count when too long to be useful
+list() {
+    if [ "$(count "$1")" -le 100 ]; then
+        tr '\n' ' ' <"$1" | sed 's/ $//'
+    else
+        printf '(%s modules)' "$(count "$1")"
+    fi
+}
+
+cmd_generate() {
+    dry_run=0 force=0 quiet=0 managed= managed_set=0 probe= probe_set=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --dry-run) dry_run=1 ;;
+            --force) force=1 ;;
+            --quiet) quiet=1 ;;
+            --managed)
+                [ $# -ge 2 ] || die 64 "--managed needs a value"
+                managed=$2 managed_set=1
+                shift
+                ;;
+            --probe)
+                [ $# -ge 2 ] || die 64 "--probe needs a value"
+                probe=$2 probe_set=1
+                shift
+                ;;
+            *) die 64 "unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    dep=$MODULES_ROOT/$KVER/modules.dep
+    [ -r "$dep" ] || die 66 "$dep not found (run depmod)"
+    [ -r "$PROC_MODULES" ] || die 66 "$PROC_MODULES not readable"
+
+    disabled=no
+    [ -e "$CONF_DIR/disabled" ] && disabled=yes
+    if [ "$disabled" = yes ] && [ "$dry_run" -eq 0 ]; then
+        rm -f "$OUTPUT"
+        echo "result=disabled"
+        return 0
+    fi
+
+    work=$(mktemp -d "${TMPDIR:-/tmp}/kmod-guard.XXXXXX")
+    trap 'rm -rf "$work"' EXIT HUP INT TERM
+
+    awk '$1 ~ /^[A-Za-z0-9_]+$/ { print $1 }' "$PROC_MODULES" | sort -u >"$work/loaded"
+    learned=$STATE_DIR/learned
+    if [ -f "$learned" ]; then
+        sort -u "$learned" >"$work/learned"
+    else
+        : >"$work/learned"
+    fi
+    sort -u "$work/loaded" "$work/learned" >"$work/seed"
+
+    # The first snapshot defines the keep-set; don't take it mid-boot, before
+    # late services have loaded their modules.
+    if [ ! -s "$work/learned" ] && [ "$force" -eq 0 ] && [ "$dry_run" -eq 0 ]; then
+        up=$(awk '{ print int($1) }' /proc/uptime 2>/dev/null || echo 0)
+        min=$(conf_get FIRST_RUN_MIN_UPTIME 1800)
+        if [ "$up" -lt "$min" ]; then
+            echo "result=skipped"
+            echo "reason=uptime ${up}s is below ${min}s on the first run (use --force to override)"
+            return 0
+        fi
+    fi
+
+    # Allow entries: managed list (file or --managed), then every other allow file
+    : >"$work/allow.raw"
+    if [ "$managed_set" -eq 1 ]; then
+        printf '%s\n' "$managed" >>"$work/allow.raw"
+    elif [ -f "$CONF_DIR/allow.d/$MANAGED_ALLOW" ]; then
+        check_owner "$CONF_DIR/allow.d/$MANAGED_ALLOW"
+        cat "$CONF_DIR/allow.d/$MANAGED_ALLOW" >>"$work/allow.raw"
+    fi
+    for f in "$CONF_DIR"/allow.d/*.conf; do
+        [ -f "$f" ] || continue
+        [ "${f##*/}" = "$MANAGED_ALLOW" ] && continue
+        check_owner "$f"
+        cat "$f" >>"$work/allow.raw"
+    done
+    awk '
+        { sub(/#.*/, "") }
+        {
+            for (i = 1; i <= NF; i++) {
+                e = $i
+                if (e ~ /^path:[A-Za-z0-9_.\/-]+$/) { print e; continue }
+                if (e ~ /^[A-Za-z0-9_*?-]+$/) { gsub(/-/, "_", e); print e; continue }
+                printf "kmod-guard: invalid allow entry: %s\n", e > "/dev/stderr"
+                bad = 1
+            }
+        }
+        END { exit bad ? 65 : 0 }
+    ' "$work/allow.raw" >"$work/allow.unsorted" || exit 65
+    sort -u "$work/allow.unsorted" >"$work/allow"
+
+    # softdep lines from depmod output and modprobe config
+    cat "$MODULES_ROOT"/*/modules.softdep /etc/modprobe.d/*.conf /run/modprobe.d/*.conf \
+        /usr/lib/modprobe.d/*.conf /lib/modprobe.d/*.conf 2>/dev/null |
+        awk '$1 == "softdep"' >"$work/softdep"
+
+    deps=
+    for f in "$MODULES_ROOT"/*/modules.dep; do
+        [ -r "$f" ] && deps="$deps $f"
+    done
+    aliases=
+    for f in "$MODULES_ROOT"/*/modules.alias; do
+        [ -r "$f" ] && aliases="$aliases $f"
+    done
+
+    # Every installed kernel's modules.dep feeds the allow matching and the
+    # dependency graph; only the running kernel's modules can be blocked.
+    # softdep targets are often aliases (libcrc32c -> crc32c), resolved
+    # through modules.alias.
+    : >"$work/keep.raw"
+    : >"$work/block.raw"
+    # shellcheck disable=SC2086 # kernel versions contain no whitespace
+    awk -v allowf="$work/allow" -v seedf="$work/seed" -v softf="$work/softdep" \
+        -v aliasfiles="$aliases" -v curdep="$dep" \
+        -v keepout="$work/keep.raw" -v blockout="$work/block.raw" '
+        function modname(p,   n) {
+            n = p
+            sub(/.*\//, "", n)
+            if (!sub(/\.ko(\.xz|\.gz|\.zst)?$/, "", n)) return ""
+            gsub(/-/, "_", n)
+            return n
+        }
+        BEGIN {
+            while ((getline e < allowf) > 0) {
+                if (e ~ /^path:/) prefix[++np] = substr(e, 6)
+                else if (e ~ /[*?]/) {
+                    g = e
+                    gsub(/\*/, ".*", g)
+                    gsub(/\?/, ".", g)
+                    glob[++ng] = "^" g "$"
+                }
+                else keep[e] = 1
+            }
+            while ((getline e < seedf) > 0) keep[e] = 1
+            while ((getline e < softf) > 0) {
+                # softdep <module> pre: <a> <b> post: <c>
+                n = split(e, f, /[ \t]+/)
+                m = f[2]
+                gsub(/-/, "_", m)
+                for (i = 3; i <= n; i++) {
+                    if (f[i] ~ /:$/ || f[i] == "") continue
+                    d = f[i]
+                    gsub(/-/, "_", d)
+                    soft[m] = soft[m] " " d
+                    want[d] = 1
+                }
+            }
+            na = split(aliasfiles, af, " ")
+            for (j = 1; j <= na; j++) {
+                while ((getline e < af[j]) > 0) {
+                    split(e, f, /[ \t]+/)
+                    a = f[2]
+                    gsub(/-/, "_", a)
+                    if (f[1] != "alias" || !(a in want)) continue
+                    t = f[3]
+                    gsub(/-/, "_", t)
+                    alias[a] = alias[a] " " t
+                }
+            }
+            for (m in soft) {
+                n = split(soft[m], s, " ")
+                for (i = 1; i <= n; i++) deps[m] = deps[m] " " s[i] alias[s[i]]
+            }
+        }
+        FNR == 1 {
+            root = FILENAME
+            sub(/modules\.dep$/, "", root)
+            running = (FILENAME == curdep)
+        }
+        {
+            # "<path>: <dep path> ..." (older depmod writes absolute paths)
+            p = $1
+            sub(/:$/, "", p)
+            if (substr(p, 1, length(root)) == root) p = substr(p, length(root) + 1)
+            m = modname(p)
+            if (m == "") next
+            if (running) universe[m] = 1
+            for (i = 2; i <= NF; i++) {
+                d = modname($i)
+                if (d != "") deps[m] = deps[m] " " d
+            }
+            if (m in keep) next
+            for (i = 1; i <= np; i++) if (index(p, prefix[i]) == 1) { keep[m] = 1; next }
+            for (i = 1; i <= ng; i++) if (m ~ glob[i]) { keep[m] = 1; next }
+        }
+        END {
+            for (m in keep) queue[++qn] = m
+            for (qi = 1; qi <= qn; qi++) {
+                n = split(deps[queue[qi]], dl, " ")
+                for (i = 1; i <= n; i++) {
+                    if (!(dl[i] in keep)) {
+                        keep[dl[i]] = 1
+                        queue[++qn] = dl[i]
+                    }
+                }
+            }
+            for (m in universe) print m > ((m in keep) ? keepout : blockout)
+        }
+    ' $deps
+    sort -u "$work/keep.raw" >"$work/keep"
+    sort -u "$work/block.raw" >"$work/block"
+
+    [ -s "$work/block" ] || die 70 "refusing to write an empty blocklist"
+    bad=$(comm -12 "$work/loaded" "$work/block" | tr '\n' ' ')
+    [ -z "$bad" ] || die 70 "refusing: loaded modules would be blocked: $bad"
+
+    if [ -f "$OUTPUT" ]; then
+        awk '$1 == "install" { print $2 }' "$OUTPUT" | sort -u >"$work/old"
+        current=$(count "$work/old")
+    else
+        : >"$work/old"
+        current=none
+    fi
+    comm -13 "$work/old" "$work/block" >"$work/newly_blocked"
+    comm -23 "$work/old" "$work/block" >"$work/newly_allowed"
+
+    {
+        echo "# Generated by kmod-guard. Do not edit."
+        echo "# Allow a module on this host: kmod-guard allow <module>"
+        echo "# Emergency off switch:        kmod-guard disable"
+        echo "# kernel=$KVER kept=$(count "$work/keep") blocked=$(count "$work/block")"
+        awk -v h="$SELF" '{ printf "install %s %s blocked %s\n", $1, h, $1 }' "$work/block"
+    } >"$work/out"
+
+    changed=no
+    cmp -s "$work/out" "$OUTPUT" || changed=yes
+
+    if [ "$quiet" -eq 0 ]; then
+        echo "kernel=$KVER"
+        echo "universe=$(($(count "$work/keep") + $(count "$work/block")))"
+        echo "kept=$(count "$work/keep")"
+        echo "blocked=$(count "$work/block")"
+        echo "loaded=$(count "$work/loaded")"
+        echo "learned=$(count "$work/learned")"
+        echo "current_blocked=$current"
+        echo "newly_blocked=$(count "$work/newly_blocked")"
+        echo "newly_blocked_list=$(list "$work/newly_blocked")"
+        echo "newly_allowed=$(count "$work/newly_allowed")"
+        echo "newly_allowed_list=$(list "$work/newly_allowed")"
+        if [ "$probe_set" -eq 1 ]; then
+            printf '%s\n' "$probe" | tr ' ' '\n' | tr '-' '_' | sed '/^$/d' | sort -u >"$work/probe"
+            echo "probe_blocked=$(comm -12 "$work/probe" "$work/block" | tr '\n' ' ' | sed 's/ $//')"
+        fi
+        echo "disabled=$disabled"
+    fi
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "result=dry-run"
+        echo "would_change=$changed"
+        return 0
+    fi
+
+    mkdir -p "$STATE_DIR"
+    if ! cmp -s "$work/seed" "$learned"; then
+        cp "$work/seed" "$learned.tmp"
+        mv -f "$learned.tmp" "$learned"
+    fi
+    if [ "$changed" = yes ]; then
+        # modprobe only reads *.conf, so the temp name is never parsed
+        tmp=${OUTPUT%/*}/.kmod-guard.$$
+        cp "$work/out" "$tmp"
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$OUTPUT"
+        echo "result=changed"
+    else
+        echo "result=unchanged"
+    fi
+}
+
+# cmd_blocked MODULE: the install handler written into kmod-guard.conf.
+# modprobe runs it through `sh -c`, so step over that shell and modprobe to
+# find who asked for the module. Kernel autoloads (request_module) come from
+# a kernel thread: pid 2 or an empty cmdline.
+cmd_blocked() {
+    set +e
+    mod=${1:-unknown}
+    pid=$PPID
+    hops=0
+    while [ "$hops" -lt 3 ]; do
+        case $(cat "/proc/$pid/comm" 2>/dev/null) in
+            sh | dash | bash) ;;
+            *) break ;;
+        esac
+        pid=$(awk '$1 == "PPid:" { print $2 }' "/proc/$pid/status" 2>/dev/null)
+        hops=$((hops + 1))
+    done
+    case $(cat "/proc/$pid/comm" 2>/dev/null) in
+        modprobe | kmod) pid=$(awk '$1 == "PPid:" { print $2 }' "/proc/$pid/status" 2>/dev/null) ;;
+    esac
+
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+    uid=$(awk '$1 == "Uid:" { print $2 }' "/proc/$pid/status" 2>/dev/null)
+    loginuid=$(cat "/proc/$pid/loginuid" 2>/dev/null)
+    [ "$loginuid" = 4294967295 ] && loginuid=unset
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | tr -d '\001-\037\177' | cut -c1-200)
+
+    if [ "$pid" = 2 ] || [ -z "$cmd" ]; then
+        trigger=autoload
+    else
+        case $comm in
+            *udev*) trigger=udev ;;
+            *) trigger=explicit ;;
+        esac
+    fi
+
+    logger -t kmod-guard -p user.warning \
+        "blocked module=$mod trigger=$trigger parent=${comm:-?}[$pid] uid=${uid:-?} loginuid=${loginuid:-?} cmd=$cmd" 2>/dev/null
+    exit "$(conf_get BLOCK_EXIT 0)"
+}
+
+cmd_allow() {
+    [ $# -gt 0 ] || die 64 "usage: kmod-guard allow <module>..."
+    for m in "$@"; do
+        case $m in
+            '' | *[!A-Za-z0-9_-]*) die 65 "invalid module name: $m" ;;
+        esac
+    done
+    mkdir -p "$CONF_DIR/allow.d"
+    f=$CONF_DIR/allow.d/local.conf
+    if [ ! -f "$f" ]; then
+        echo "# Added on this host with 'kmod-guard allow'." >"$f"
+    fi
+    printf '%s  # %s %s\n' "$*" "$(date +%F)" "${SUDO_USER:-$(id -un)}" >>"$f"
+    chmod 0644 "$f"
+    cmd_generate --force
+}
+
+cmd_disable() {
+    mkdir -p "$CONF_DIR"
+    : >"$CONF_DIR/disabled"
+    rm -f "$OUTPUT"
+    logger -t kmod-guard "disabled by ${SUDO_USER:-$(id -un)}" 2>/dev/null || true
+    echo "kmod-guard disabled, $OUTPUT removed. Re-enable with: kmod-guard enable"
+}
+
+cmd_enable() {
+    rm -f "$CONF_DIR/disabled"
+    cmd_generate --force
+}
+
+cmd_status() {
+    echo "kernel:  $KVER"
+    if [ -e "$CONF_DIR/disabled" ]; then
+        echo "state:   DISABLED (kmod-guard enable to turn it back on)"
+    elif [ -f "$OUTPUT" ]; then
+        echo "state:   enforcing, $(grep -c '^install ' "$OUTPUT") modules blocked"
+    else
+        echo "state:   no blocklist yet"
+    fi
+    if [ -f "$CONF_DIR/allow.d/local.conf" ]; then
+        echo "local allows:"
+        grep -v '^#' "$CONF_DIR/allow.d/local.conf" | sed 's/^/  /'
+    fi
+    if command -v journalctl >/dev/null 2>&1; then
+        echo "recent blocks:"
+        journalctl -t kmod-guard -n 20 --no-pager -o short-iso 2>/dev/null | sed 's/^/  /'
+    fi
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+    generate) cmd_generate "$@" ;;
+    blocked) cmd_blocked "$@" ;;
+    allow) cmd_allow "$@" ;;
+    disable) cmd_disable ;;
+    enable) cmd_enable ;;
+    status) cmd_status ;;
+    version | --version) echo "kmod-guard $VERSION" ;;
+    help | -h | --help) usage ;;
+    *)
+        usage >&2
+        exit 64
+        ;;
+esac

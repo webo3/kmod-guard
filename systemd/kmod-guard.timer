@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily kmod-guard blocklist regeneration
+
+[Timer]
+OnBootSec=2h
+OnUnitActiveSec=1d
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
