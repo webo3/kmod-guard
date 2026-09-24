@@ -5,5 +5,6 @@
 check() { return 0; }
 depends() { return 0; }
 install() {
+    # shellcheck disable=SC2154 # initdir is set by dracut
     rm -f "${initdir}/etc/modprobe.d/kmod-guard.conf"
 }

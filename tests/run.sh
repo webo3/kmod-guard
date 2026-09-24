@@ -27,6 +27,7 @@ check() {
     fi
 }
 blocked() { grep -q "^install $1 " "$OUT"; }
+printed() { printf '%s\n' "$out" | grep -qx "$1"; }
 loaded() { printf '%s 1 0 - Live 0x0\n' "$@" >"$R/proc_modules"; }
 
 # 6.1.0-new: xfs gained a libcrc32c dependency, libcrc32c has an alias softdep
@@ -92,7 +93,7 @@ loaded xfs ext4 jbd2
 echo "--- first run on the old kernel"
 echo 'FIRST_RUN_MIN_UPTIME=999999999' >"$R/etc/kmod-guard.conf"
 out=$(KMOD_GUARD_KVER=6.0.0-old $KG generate 2>&1)
-check "first run waits for uptime" "echo \"\$out\" | grep -qx result=skipped && [ ! -e '$OUT' ]"
+check "first run waits for uptime" "printed result=skipped && [ ! -e '$OUT' ]"
 rm -f "$R/etc/kmod-guard.conf"
 KMOD_GUARD_KVER=6.0.0-old $KG generate --force >/dev/null 2>&1
 check "loaded xfs kept" "! blocked xfs"
@@ -114,7 +115,7 @@ check "af_alg blocked" "blocked af_alg"
 check "wireguard blocked" "blocked wireguard"
 check "install line format" "grep -qx 'install sctp /usr/local/sbin/kmod-guard blocked sctp' '$OUT'"
 out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate 2>&1)
-check "second run unchanged" "echo \"\$out\" | grep -qx result=unchanged"
+check "second run unchanged" "printed result=unchanged"
 
 echo "--- dependency closure"
 echo 'nfs wireguard' >"$R/etc/allow.d/local.conf"
@@ -136,12 +137,12 @@ check "sctp stays allowed after unload" "! blocked sctp"
 echo "--- dry-run, --managed, --probe"
 before=$(cksum <"$OUT")
 out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate --dry-run --managed 'nf_*' --probe 'amd64-edac tipc xfs' 2>&1)
-check "probe reports only blocked modules" "echo \"\$out\" | grep -qx 'probe_blocked=amd64_edac tipc'"
+check "probe reports only blocked modules" "printed 'probe_blocked=amd64_edac tipc'"
 out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate --dry-run --probe '' 2>&1)
-check "empty probe still prints the key" "echo \"\$out\" | grep -qx 'probe_blocked='"
+check "empty probe still prints the key" "printed 'probe_blocked='"
 check "dry-run writes nothing" "[ \"\$(cksum <'$OUT')\" = \"$before\" ]"
 out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate --dry-run --managed "$(cat "$here"/../examples/allow.d/*.conf)" 2>&1)
-check "example allow files parse" "echo \"\$out\" | grep -qx result=dry-run"
+check "example allow files parse" "printed result=dry-run"
 
 echo "--- guards"
 chmod 666 "$R/etc/allow.d/local.conf"
@@ -160,7 +161,7 @@ echo "--- disable / enable / allow"
 $KG disable >/dev/null 2>&1
 check "disable removes the blocklist" "[ ! -e '$OUT' ]"
 out=$(KMOD_GUARD_KVER=6.1.0-new $KG generate 2>&1)
-check "generate honours disabled" "echo \"\$out\" | grep -qx result=disabled && [ ! -e '$OUT' ]"
+check "generate honours disabled" "printed result=disabled && [ ! -e '$OUT' ]"
 KMOD_GUARD_KVER=6.1.0-new $KG enable >/dev/null 2>&1
 check "enable regenerates" "[ -s '$OUT' ]"
 KMOD_GUARD_KVER=6.1.0-new $KG allow tipc >/dev/null 2>&1

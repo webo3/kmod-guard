@@ -75,7 +75,7 @@ conf_get() {
 # check_owner FILE: allow files are trusted by whoever runs this (root), so
 # only root or that user may own or write them
 check_owner() {
-    ls -ln "$1" | awk -v me="$(id -u)" '{ exit (($3 != 0 && $3 != me) || substr($1, 6, 1) == "w" || substr($1, 9, 1) == "w") }' ||
+    [ -n "$(find "$1" \( -user 0 -o -user "$(id -u)" \) ! -perm -020 ! -perm -002)" ] ||
         die 77 "$1 must be owned by root and not group/world-writable"
 }
 
@@ -93,7 +93,7 @@ list() {
 }
 
 cmd_generate() {
-    dry_run=0 force=0 quiet=0 managed= managed_set=0 probe= probe_set=0
+    dry_run=0 force=0 quiet=0 managed='' managed_set=0 probe='' probe_set=0
     while [ $# -gt 0 ]; do
         case $1 in
             --dry-run) dry_run=1 ;;
@@ -381,7 +381,7 @@ cmd_blocked() {
     comm=$(cat "/proc/$pid/comm" 2>/dev/null)
     uid=$(awk '$1 == "Uid:" { print $2 }' "/proc/$pid/status" 2>/dev/null)
     loginuid=$(cat "/proc/$pid/loginuid" 2>/dev/null)
-    [ "$loginuid" = 4294967295 ] && loginuid=unset
+    [ "$loginuid" = 4294967295 ] && loginuid='unset'
     cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | tr -d '\001-\037\177' | cut -c1-200)
 
     if [ "$pid" = 2 ] || [ -z "$cmd" ]; then
