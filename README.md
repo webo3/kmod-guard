@@ -92,9 +92,10 @@ kmod-guard generate [--dry-run] [--force] [--quiet] [--managed "<entries>"]
                     [--managed-deny "<entries>"] [--probe "<modules>"]
 kmod-guard allow <module>...    allow on this host now (written to allow.d/local.conf)
 kmod-guard deny <module>...     block on this host now, even if allowed (deny.d/local.conf)
-kmod-guard list [blocked|kept|denied]
+kmod-guard list [--managed "<entries>"] [--managed-deny "<entries>"] [blocked|kept|denied]
                                 modules the current configuration blocks (default), keeps or denies
-kmod-guard check <module>...    would these modules be blocked, and why; a glob searches by name
+kmod-guard check [--managed "<entries>"] [--managed-deny "<entries>"] <module>...
+                                would these modules be blocked, and why; a glob searches by name
 kmod-guard disable              remove the blocklist; stays off until `kmod-guard enable`
 kmod-guard enable
 kmod-guard status               state, local allows and denies, recent blocks
@@ -109,7 +110,7 @@ To load a blocked module once, as root: `modprobe --ignore-install <module>`.
 
 ## Checking a module
 
-`list` and `check` compute the blocklist from the current configuration and write nothing. `list` prints one module per line. `check` prints each module's verdict and the first reason it applies:
+`list` and `check` compute the blocklist from the current configuration and write nothing. With `--managed` and `--managed-deny` they answer for those lists instead of `00-managed.conf`, as `generate --dry-run` does: `kmod-guard check --managed "<entries>" '*'` gives every module's verdict and reason under a new managed list. `list` prints one module per line. `check` prints each module's verdict and the first reason it applies:
 
 ```
 $ kmod-guard check sctp xfs sunrpc 'nft_c*' bridge
@@ -129,7 +130,7 @@ The verdicts are `blocked`, `kept`, `builtin` and `unknown` (no such module in t
 
 A blocked module's reason is the deny entry that matched, if any. A loaded module that a deny entry matches shows `loaded (deny.d: … applies once unloaded)`.
 
-If the blocklist modprobe uses doesn't match the current configuration, `list` and `check` say so on stderr. That happens when `generate` hasn't run since a change, or when kmod-guard is disabled.
+If the blocklist modprobe uses doesn't match the current configuration, `list` and `check` say so on stderr. That happens when `generate` hasn't run since a change, when kmod-guard is disabled, or when `--managed` lists differ from the managed files.
 
 ## Logs
 

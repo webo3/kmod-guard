@@ -35,7 +35,7 @@ export LC_ALL
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-VERSION=0.1.1
+VERSION=0.1.2
 SELF=/usr/local/sbin/kmod-guard
 CONF_DIR=${KMOD_GUARD_CONF_DIR:-/etc/kmod-guard}
 STATE_DIR=${KMOD_GUARD_STATE_DIR:-/var/lib/kmod-guard}
@@ -58,11 +58,13 @@ Usage:
   kmod-guard allow <module>...   allow on this host now (allow.d/local.conf)
   kmod-guard deny <module>...    block on this host now, even if allowed
                                  (deny.d/local.conf); unload it first
-  kmod-guard list [blocked|kept|denied]
+  kmod-guard list [options] [blocked|kept|denied]
                                  modules the current configuration blocks
                                  (default), keeps or denies, one per line
-  kmod-guard check <module>...   would these modules be blocked, and why;
+  kmod-guard check [options] <module>...
+                                 would these modules be blocked, and why;
                                  a glob (nft_*, *sctp*) searches by name
+      --managed, --managed-deny  as for generate: answer for these lists
   kmod-guard disable             remove the blocklist until `kmod-guard enable`
   kmod-guard enable
   kmod-guard status
@@ -577,8 +579,8 @@ cmd_deny() {
     cmd_generate --force
 }
 
-# note_enforced: list and check answer for the current configuration; say on
-# stderr when that is not what modprobe enforces right now
+# note_enforced: list and check answer for the current configuration, or the
+# --managed lists; say on stderr when that is not what modprobe enforces now
 note_enforced() {
     if [ -e "$CONF_DIR/disabled" ]; then
         echo "kmod-guard: disabled, nothing is blocked until kmod-guard enable" >&2
@@ -586,30 +588,61 @@ note_enforced() {
         echo "kmod-guard: no $OUTPUT yet, nothing is blocked until kmod-guard generate" >&2
     else
         awk '$1 == "install" { print $2 }' "$OUTPUT" | sort -u >"$work/enforced"
-        cmp -s "$work/enforced" "$work/block" ||
+        if cmp -s "$work/enforced" "$work/block"; then
+            :
+        elif [ "$managed_set" -eq 1 ] || [ "$managed_deny_set" -eq 1 ]; then
+            echo "kmod-guard: $OUTPUT differs from these lists" >&2
+        else
             echo "kmod-guard: $OUTPUT is out of date, kmod-guard generate applies this" >&2
+        fi
     fi
 }
 
-# cmd_list [blocked|kept|denied]: one module per line, read-only
+# managed_args ARG...: the leading --managed / --managed-deny options of list
+# and check, as in generate; nopts is the number of arguments they took
+managed_args() {
+    managed='' managed_set=0 managed_deny='' managed_deny_set=0 nopts=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --managed)
+                [ $# -ge 2 ] || die 64 "--managed needs a value"
+                managed=$2 managed_set=1
+                ;;
+            --managed-deny)
+                [ $# -ge 2 ] || die 64 "--managed-deny needs a value"
+                managed_deny=$2 managed_deny_set=1
+                ;;
+            -*) die 64 "unknown option: $1" ;;
+            *) return 0 ;;
+        esac
+        shift 2
+        nopts=$((nopts + 2))
+    done
+}
+
+# cmd_list [--managed ...] [blocked|kept|denied]: one module per line, read-only
 cmd_list() {
+    managed_args "$@"
+    shift "$nopts"
     case ${1:-blocked} in
         blocked) set -- block ;;
         kept) set -- keep ;;
         denied) set -- denied ;;
-        *) die 64 "usage: kmod-guard list [blocked|kept|denied]" ;;
+        *) die 64 "usage: kmod-guard list [--managed ...] [--managed-deny ...] [blocked|kept|denied]" ;;
     esac
     need_inputs
     prepare
-    compute 0 '' 0 ''
+    compute "$managed_set" "$managed" "$managed_deny_set" "$managed_deny"
     cat "$work/$1"
     note_enforced
 }
 
-# cmd_check MODULE|GLOB...: verdict and reason per module, read-only. A glob
-# searches the running kernel's modules by name.
+# cmd_check [--managed ...] MODULE|GLOB...: verdict and reason per module,
+# read-only. A glob searches the running kernel's modules by name.
 cmd_check() {
-    [ $# -gt 0 ] || die 64 "usage: kmod-guard check <module|glob>..."
+    managed_args "$@"
+    shift "$nopts"
+    [ $# -gt 0 ] || die 64 "usage: kmod-guard check [--managed ...] [--managed-deny ...] <module|glob>..."
     for m in "$@"; do
         case $m in
             '' | *[!A-Za-z0-9_*?-]*) die 65 "invalid module name or glob: $m" ;;
@@ -617,7 +650,7 @@ cmd_check() {
     done
     need_inputs
     prepare
-    compute 0 '' 0 ''
+    compute "$managed_set" "$managed" "$managed_deny_set" "$managed_deny"
     printf '%s\n' "$@" | tr - _ >"$work/query"
     awk -v queryf="$work/query" -v whyf="$work/why" -v kver="$KVER" \
         -v builtinf="$MODULES_ROOT/$KVER/modules.builtin" '

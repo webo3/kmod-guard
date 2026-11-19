@@ -245,6 +245,21 @@ check "check: glob searches, once per module" \
 check "check: glob without a match" "row 'zz*' unknown 'no module of 6.1.0-new matches'"
 $KG check 'bad;name' >/dev/null 2>&1
 check "check rejects an invalid name (65)" "[ $? -eq 65 ]"
+out=$($KG check --managed 'xt_*' nf_conntrack xt_recent amd64-edac 2>&1)
+check "check --managed replaces 00-managed.conf" \
+    "row xt_recent kept 'allow.d: xt_*' && row nf_conntrack blocked 'not loaded, learned, allowed or a dependency' && row amd64_edac blocked 'not loaded, learned, allowed or a dependency'"
+check "check --managed: note when the lists differ" "printed 'kmod-guard: $OUT differs from these lists'"
+out=$($KG check --managed-deny nf-conntrack nf_conntrack nf_conntrack_netlink 2>&1)
+check "check --managed-deny" \
+    "row nf_conntrack blocked 'deny.d: nf_conntrack' && row nf_conntrack_netlink kept 'allow.d: nf_*'"
+out=$($KG list --managed 'xt_*' kept 2>&1)
+check "list --managed" "printed xt_recent && ! printed nf_conntrack && ! printed amd64_edac"
+out=$($KG list --managed 'xt_*' 2>/dev/null)
+check "list --managed defaults to blocked" "printed nf_conntrack && ! printed xt_recent"
+$KG check --bogus xfs >/dev/null 2>&1
+check "check rejects an unknown option (64)" "[ $? -eq 64 ]"
+$KG list --managed >/dev/null 2>&1
+check "--managed needs a value (64)" "[ $? -eq 64 ]"
 check "list and check write nothing" "[ \"\$(cat '$OUT' '$R/state/learned' | cksum)\" = \"$before\" ]"
 loaded xfs tipc
 out=$($KG check tipc 2>&1)
