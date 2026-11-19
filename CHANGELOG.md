@@ -13,4 +13,5 @@ First version.
 - `kmod-guard deny <module>` writes `deny.d/local.conf`. It refuses a loaded module (exit 75, unload it with `rmmod` first), and names that aren't modules of the running kernel or are built in.
 - `generate --managed-deny` previews a managed deny list; the summary gains `denied`, `denied_list` and `deny_loaded_list`.
 - `kmod-guard allow` warns when a deny entry still blocks the module.
+- `kmod-guard list [blocked|kept|denied]` prints those modules, one per line. `kmod-guard check <module|glob>...` prints whether each would be blocked and why (loaded, learned, allow or deny entry, dependency of a module), and also reports built-in and unknown names. Both are read-only, and both warn on stderr when the enforced blocklist is out of date or kmod-guard is disabled.
 - initramfs-tools and dracut hooks, daily systemd timer, example allow lists.

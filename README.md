@@ -92,6 +92,9 @@ kmod-guard generate [--dry-run] [--force] [--quiet] [--managed "<entries>"]
                     [--managed-deny "<entries>"] [--probe "<modules>"]
 kmod-guard allow <module>...    allow on this host now (written to allow.d/local.conf)
 kmod-guard deny <module>...     block on this host now, even if allowed (deny.d/local.conf)
+kmod-guard list [blocked|kept|denied]
+                                modules the current configuration blocks (default), keeps or denies
+kmod-guard check <module>...    would these modules be blocked, and why; a glob searches by name
 kmod-guard disable              remove the blocklist; stays off until `kmod-guard enable`
 kmod-guard enable
 kmod-guard status               state, local allows and denies, recent blocks
@@ -100,9 +103,33 @@ kmod-guard version
 
 `generate` prints a `key=value` summary (counts, newly blocked and newly allowed modules), ending with `result=changed|unchanged|skipped|disabled`. With `--dry-run` it ends with `result=dry-run` and `would_change=yes|no` instead. Two options serve configuration management:
 - `--managed` and `--managed-deny` preview new managed lists without writing them.
-- `--probe` answers "which of these modules would be blocked here?".
+- `--probe` answers "which of these modules would be blocked here?". Without `--dry-run`, `generate` still writes the blocklist.
 
 To load a blocked module once, as root: `modprobe --ignore-install <module>`.
+
+## Checking a module
+
+`list` and `check` compute the blocklist from the current configuration and write nothing. `list` prints one module per line. `check` prints each module's verdict and the first reason it applies:
+
+```
+$ kmod-guard check sctp xfs sunrpc 'nft_c*' bridge
+sctp           blocked  not loaded, learned, allowed or a dependency
+xfs            kept     loaded
+sunrpc         kept     dependency of nfs
+nft_chain_nat  kept     allow.d: nft_*
+nft_compat     kept     allow.d: nft_*
+bridge         builtin  built into 6.8.12-4-pve, not a loadable module
+```
+
+The verdicts are `blocked`, `kept`, `builtin` and `unknown` (no such module in the running kernel). Reasons for keeping a module, checked in this order:
+- `loaded`
+- `learned (loaded here before)`
+- the allow entry that matched
+- `dependency of <module>`
+
+A blocked module's reason is the deny entry that matched, if any. A loaded module that a deny entry matches shows `loaded (deny.d: … applies once unloaded)`.
+
+If the blocklist modprobe uses doesn't match the current configuration, `list` and `check` say so on stderr. That happens when `generate` hasn't run since a change, or when kmod-guard is disabled.
 
 ## Logs
 

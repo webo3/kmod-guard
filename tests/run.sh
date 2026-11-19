@@ -209,6 +209,53 @@ loaded xfs
 KMOD_GUARD_KVER=6.1.0-new $KG generate >/dev/null 2>&1
 check "deny applies again once unloaded" "blocked tipc"
 
+echo "--- list, check"
+# row MODULE VERDICT REASON: a line of check output
+row() {
+    printf '%s\n' "$out" | awk -v m="$1" -v v="$2" -v r="$3" '
+        $1 == m && $2 == v { $1 = $2 = ""; sub(/^ +/, ""); if ($0 == r) f = 1 }
+        END { exit !f }'
+}
+export KMOD_GUARD_KVER=6.1.0-new
+before=$(cat "$OUT" "$R/state/learned" | cksum)
+out=$($KG list 2>&1)
+check "list prints the blocklist, in sync" \
+    "[ \"\$out\" = \"\$(awk '\$1 == \"install\" { print \$2 }' '$OUT' | sort)\" ]"
+out=$($KG list kept 2>&1)
+check "list kept" "printed xfs && printed sunrpc && ! printed tipc"
+out=$($KG list denied 2>&1)
+check "list denied" "[ \"\$out\" = tipc ]"
+$KG list bogus >/dev/null 2>&1
+check "list rejects an unknown set (64)" "[ $? -eq 64 ]"
+out=$($KG check xfs sctp amd64-edac nf_conntrack sunrpc crc32c_generic tipc n_gsm bridge no_such_mod 2>&1)
+check "check: loaded" "row xfs kept loaded"
+check "check: learned" "row sctp kept 'learned (loaded here before)'"
+check "check: allow path, dash normalised" "row amd64_edac kept 'allow.d: path:kernel/drivers/edac/'"
+check "check: allow glob" "row nf_conntrack kept 'allow.d: nf_*'"
+check "check: dependency" "row sunrpc kept 'dependency of nfs'"
+check "check: softdep alias" "row crc32c_generic kept 'dependency of libcrc32c'"
+check "check: denied" "row tipc blocked 'deny.d: tipc'"
+check "check: not kept" "row n_gsm blocked 'not loaded, learned, allowed or a dependency'"
+check "check: built in" "row bridge builtin 'built into 6.1.0-new, not a loadable module'"
+check "check: unknown" "row no_such_mod unknown 'not a module of 6.1.0-new'"
+check "check: no note when in sync" "! printf '%s\n' \"\$out\" | grep -q '^kmod-guard:'"
+out=$($KG check 'nfs*' 'zz*' nfs 2>&1)
+check "check: glob searches, once per module" \
+    "row nfs kept 'allow.d: nfs' && row nfsv4 blocked 'not loaded, learned, allowed or a dependency' && [ \$(printf '%s\n' \"\$out\" | wc -l) -eq 3 ]"
+check "check: glob without a match" "row 'zz*' unknown 'no module of 6.1.0-new matches'"
+$KG check 'bad;name' >/dev/null 2>&1
+check "check rejects an invalid name (65)" "[ $? -eq 65 ]"
+check "list and check write nothing" "[ \"\$(cat '$OUT' '$R/state/learned' | cksum)\" = \"$before\" ]"
+loaded xfs tipc
+out=$($KG check tipc 2>&1)
+check "check: loaded but denied" \
+    "row tipc kept 'loaded (deny.d: tipc applies once unloaded)' && printed 'kmod-guard: $OUT is out of date, kmod-guard generate applies this'"
+loaded xfs
+out=$($KG disable 2>&1; $KG list 2>&1 >/dev/null)
+check "list says when disabled" "printed 'kmod-guard: disabled, nothing is blocked until kmod-guard enable'"
+$KG enable >/dev/null 2>&1
+unset KMOD_GUARD_KVER
+
 if [ -r /proc/self/status ]; then
     echo "--- blocked handler (Linux)"
     $KG blocked testmod >/dev/null 2>&1
